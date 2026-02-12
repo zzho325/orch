@@ -173,6 +173,7 @@ fn cmd_status() {
 
                     let has_session = Command::new("tmux")
                         .args(["has-session", "-t", &session_name])
+                        .stderr(std::process::Stdio::null())
                         .status()
                         .is_ok_and(|s| s.success());
 
