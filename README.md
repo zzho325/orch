@@ -1,84 +1,56 @@
 # orch
 
-A Rust CLI that watches `~/tasks/` for markdown files and uses Claude to manage AI workers in tmux sessions.
+Drop markdown files in `~/tasks/`. AI workers pick them up.
 
-## How it works
-
-1. Drop a `.md` file in `~/tasks/` — can be vague, a Linear link, whatever
-2. The daemon detects the change and runs Claude with the orchestrator prompt
-3. Claude reads all tasks, checks tmux sessions, and spins up interactive Claude Code workers
-4. You check in when you want — or the daemon re-scans every 5 minutes
-
-All state lives in the task files and tmux sessions. The orchestrator is stateless — every scan reconstructs the world from scratch.
-
-## Install
+A Rust CLI that watches `~/tasks/` for markdown files and uses Claude to manage AI workers in tmux sessions. The Rust binary is the heartbeat. The AI is the brain. The filesystem is the database.
 
 ```bash
 cargo install --path .
-cp orchestrator.md ~/bin/orchestrator.md  # prompt file goes next to binary
 ```
 
-## Commands
+## Usage
 
 ```
-orch                    # show task status
-orch status             # same
-orch inbox              # tasks needing your attention
-orch jump <name>        # switch to a worker's tmux session
-orch scan               # trigger a one-shot scan
-orch daemon             # run the background watcher
-orch - <message>        # talk to the orchestrator in natural language
+orch daemon &                          # start watching ~/tasks/
+echo "fix the auth bug" > ~/tasks/auth.md  # create a task
+orch                                   # check status
+orch jump auth                         # hop into the worker session
+orch - close the auth task             # talk to the orchestrator
 ```
 
-## Example
-
-```bash
-# Start the daemon
-orch daemon &
-
-# Create a task
-echo "# Fix auth race condition\nCheck session.ts for timing issues" > ~/tasks/fix-auth.md
-
-# The daemon picks it up, spins up a Claude worker in tmux
-
-# Check status
-orch status
-
-# Jump into the worker session
-orch jump fix-auth
-
-# Tell the orchestrator to close it
-orch - close the fix-auth task
-```
-
-## Task files
-
-Tasks are freeform markdown in `~/tasks/`. No schema required. The orchestrator appends a `## Status` section as work progresses.
-
-```markdown
-# Fix Auth Race Condition
-
-Check the logic in session.ts. We're seeing a race condition
-where the token isn't set before the dashboard fetches data.
-```
-
-## Architecture
+## Status example
 
 ```
-~/tasks/*.md              task queue (source of truth)
-~/bin/orch                rust binary (watcher + CLI)
-~/bin/orchestrator.md     prompt file (the orchestrator's brain)
-tmux task-* sessions      workers (interactive Claude Code sessions)
+$ orch
+## Tasks
+
+  check-recon-timing
+    status: Pushed fix to ashley/ENG-23525. Extended recon time window
+            so all daily batches fall within the correct day. Ready for PR.
+    worker: running (task-check-recon)
+
+  check-adjustments-review
+    status: Produced detailed guide covering check adjustment cases.
+            Still in progress.
+    worker: running (task-check-adj)
+
+## Workers
+
+  task-check-adj: 2 windows (created Thu Feb 12 12:30:32 2026)
+  task-check-recon: 1 windows (created Thu Feb 12 12:09:35 2026)
 ```
 
-The Rust binary is the heartbeat. The AI is the brain. The filesystem is the database.
+## How it works
 
-## Configuration
+Rust binary is the heartbeat. AI is the brain. Filesystem is the database.
 
-Edit `orchestrator.md` to customize the orchestrator's behavior — it's just a prompt. The binary reads it at runtime, no rebuild needed.
+1. You drop a `.md` file in `~/tasks/` — can be vague, a Linear link, whatever
+2. The daemon detects the change — file watcher triggers
+3. It runs `claude -p` with the orchestrator prompt — Claude reads all tasks, checks tmux sessions, decides what to do
+4. Claude spins up a worker — a new tmux session running an interactive Claude Code instance, seeded with the task content
+5. You check in when you want — `orch status`, `orch inbox`, `orch jump <name>`
+6. Every 5 minutes — the daemon re-scans, peeks at worker panes, updates task files with progress
 
-## Requirements
+Edit `orchestrator.md` to change behavior — no rebuild needed.
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-- tmux
-- Rust (to build)
+Requires [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and tmux.
