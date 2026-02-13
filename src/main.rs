@@ -23,8 +23,6 @@ enum Cmd {
     Daemon,
     /// Show status of all tasks and workers
     Status,
-    /// Show tasks that need your input
-    Inbox,
     /// Attach to a task's tmux session
     Jump {
         /// Task name (matches task-<name> tmux session)
@@ -43,12 +41,17 @@ enum Cmd {
 fn prompt_file() -> PathBuf {
     // Look next to the binary first, then fall back to compile-time path
     let exe = std::env::current_exe().unwrap_or_default();
-    let beside_exe = exe.parent().unwrap_or(std::path::Path::new(".")).join("orchestrator.md");
+    let beside_exe = exe
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("orchestrator.md");
     if beside_exe.exists() {
         return beside_exe;
     }
     // Fallback: ~/orchestrator/orchestrator.md
-    dirs::home_dir().unwrap_or_default().join("orchestrator/orchestrator.md")
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join("orchestrator/orchestrator.md")
 }
 
 fn run_orchestrator_with_message(message: &str) {
@@ -65,24 +68,54 @@ fn run_orchestrator_with_message(message: &str) {
 
     let prompt = format!("{system_prompt}\n\n---\n\n{message}");
 
-    let status = Command::new("claude")
-        .args(["-p", "--dangerously-skip-permissions", &prompt])
+    use std::io::Write;
+
+    let mut child = match Command::new("claude")
+        .args(["-p", "--dangerously-skip-permissions"])
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
-        .status();
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[orch] failed to run claude: {e}");
+            return;
+        }
+    };
 
-    match status {
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(prompt.as_bytes());
+    }
+
+    match child.wait() {
         Ok(s) => {
             if !s.success() {
                 eprintln!("[orch] claude exited with {s}");
             }
         }
-        Err(e) => eprintln!("[orch] failed to run claude: {e}"),
+        Err(e) => eprintln!("[orch] claude wait failed: {e}"),
     }
 }
 
-fn run_orchestrator() {
-    run_orchestrator_with_message("Scan ~/tasks/ and tmux sessions. For any unstarted task without a worker, spin up an interactive tmux worker session. Update task files with status. Report what you did.");
+fn run_inbox() {
+    let inbox = tasks_dir().join(".inbox");
+    if let Ok(msg) = fs::read_to_string(&inbox) {
+        if !msg.trim().is_empty() {
+            let _ = fs::remove_file(&inbox);
+            run_orchestrator_with_message(&msg);
+        }
+    }
+}
+
+const SCAN_MSG: &str = "Scan ~/tasks/ and tmux sessions. For any unstarted task without a worker, \
+    spin up an interactive tmux worker session. Update task files with status. Report what you did.";
+
+fn run_new_task(files: &[String]) {
+    run_orchestrator_with_message(&format!(
+        "Task files changed: {}. Check these tasks and handle them — spin up workers for new tasks, update status for existing ones.",
+        files.join(", ")
+    ));
 }
 
 fn cmd_daemon() {
@@ -92,8 +125,10 @@ fn cmd_daemon() {
     }
 
     eprintln!("[orch] daemon started, watching {}", dir.display());
+    // Process any pending inbox before scanning
+    run_inbox();
     eprintln!("[orch] running initial scan...");
-    run_orchestrator();
+    run_orchestrator_with_message(SCAN_MSG);
 
     let (tx, rx) = mpsc::channel();
     let mut debouncer =
@@ -110,18 +145,29 @@ fn cmd_daemon() {
     loop {
         match rx.recv_timeout(poll_interval) {
             Ok(Ok(events)) => {
+                let has_inbox = events
+                    .iter()
+                    .any(|e| e.path.file_name().is_some_and(|f| f == ".inbox"));
                 let has_md = events
                     .iter()
                     .any(|e| e.path.extension().is_some_and(|ext| ext == "md"));
+                if has_inbox {
+                    run_inbox();
+                }
                 if has_md {
-                    run_orchestrator();
+                    let changed: Vec<String> = events
+                        .iter()
+                        .filter(|e| e.path.extension().is_some_and(|ext| ext == "md"))
+                        .filter_map(|e| e.path.file_name().map(|f| f.to_string_lossy().to_string()))
+                        .collect();
+                    run_new_task(&changed);
                 }
             }
             Ok(Err(e)) => eprintln!("[orch] watch error: {e:?}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Periodic check on workers
                 eprintln!("[orch] periodic check...");
-                run_orchestrator();
+                run_orchestrator_with_message(SCAN_MSG);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 eprintln!("[orch] channel closed");
@@ -133,6 +179,19 @@ fn cmd_daemon() {
 
 fn cmd_status() {
     let dir = tasks_dir();
+
+    // Get all task-* tmux sessions
+    let sessions: Vec<String> = Command::new("tmux")
+        .arg("ls")
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| l.starts_with("task-"))
+                .map(|l| l.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Read task files
     println!("## Tasks\n");
@@ -146,46 +205,25 @@ fn cmd_status() {
                     let name = path.file_stem().unwrap_or_default().to_string_lossy();
                     let content = fs::read_to_string(&path).unwrap_or_default();
 
-                    // Check for status section
-                    let status = if content.contains("## Status") {
-                        // Extract last status line
-                        content
-                            .lines()
-                            .rev()
-                            .find(|l| !l.trim().is_empty())
-                            .unwrap_or("unknown")
-                            .trim()
-                    } else {
-                        "new"
-                    };
-
-                    // Extract session name from status section if present
-                    let session_name = content
+                    // First non-empty line as description
+                    let desc = content
                         .lines()
-                        .find_map(|l| {
-                            // Look for backtick-quoted session names like `task-foo`
-                            let rest = l.find("`task-")?;
-                            let start = rest + 1;
-                            let end = l[start..].find('`')? + start;
-                            Some(l[start..end].to_string())
-                        })
-                        .unwrap_or_else(|| format!("task-{name}"));
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("")
+                        .trim()
+                        .trim_start_matches('#')
+                        .trim();
 
-                    let has_session = Command::new("tmux")
-                        .args(["has-session", "-t", &session_name])
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .is_ok_and(|s| s.success());
-
-                    let worker = if has_session {
-                        format!("running ({session_name})")
-                    } else {
-                        "none".to_string()
-                    };
+                    // Find matching tmux session
+                    let worker = sessions
+                        .iter()
+                        .find(|s| s.starts_with(&format!("task-{name}")))
+                        .map(|s| s.as_str())
+                        .unwrap_or("no worker");
 
                     println!("  {name}");
-                    println!("    status: {status}");
-                    println!("    worker: {worker}");
+                    println!("    {desc}");
+                    println!("    {worker}");
                     println!();
                 }
             }
@@ -194,74 +232,6 @@ fn cmd_status() {
             }
         }
         Err(_) => println!("  ~/tasks/ not found"),
-    }
-
-    // Show tmux sessions
-    println!("## Workers\n");
-    let output = Command::new("tmux").arg("ls").output();
-    match output {
-        Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let mut found = false;
-            for line in stdout.lines() {
-                if line.starts_with("task-") {
-                    found = true;
-                    println!("  {line}");
-                }
-            }
-            if !found {
-                println!("  (no active workers)");
-            }
-        }
-        Err(_) => println!("  tmux not running"),
-    }
-}
-
-fn cmd_inbox() {
-    let dir = tasks_dir();
-
-    println!("## Needs Your Attention\n");
-    let mut found = false;
-
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "md") {
-                let content = fs::read_to_string(&path).unwrap_or_default();
-                let lower = content.to_lowercase();
-
-                if lower.contains("waiting for input")
-                    || lower.contains("needs input")
-                    || lower.contains("needs decision")
-                    || lower.contains("blocked")
-                    || lower.contains("question")
-                {
-                    found = true;
-                    let name = path.file_stem().unwrap_or_default().to_string_lossy();
-
-                    // Find the relevant line
-                    let context = content
-                        .lines()
-                        .find(|l| {
-                            let ll = l.to_lowercase();
-                            ll.contains("waiting")
-                                || ll.contains("needs input")
-                                || ll.contains("blocked")
-                                || ll.contains("question")
-                        })
-                        .unwrap_or("");
-
-                    println!("  {name}");
-                    println!("    {context}");
-                    println!("    -> orch jump {name}");
-                    println!();
-                }
-            }
-        }
-    }
-
-    if !found {
-        println!("  Nothing needs your attention right now.");
     }
 }
 
@@ -281,9 +251,7 @@ fn cmd_jump(name: &str) {
     if !exists {
         eprintln!("No tmux session '{session}' found.");
         eprintln!("Active task sessions:");
-        let _ = Command::new("tmux")
-            .arg("ls")
-            .status();
+        let _ = Command::new("tmux").arg("ls").status();
         return;
     }
 
@@ -304,11 +272,19 @@ fn main() {
 
     match cli.command {
         Some(Cmd::Daemon) => cmd_daemon(),
-        Some(Cmd::Status) => cmd_status(),
-        Some(Cmd::Inbox) => cmd_inbox(),
         Some(Cmd::Jump { name }) => cmd_jump(&name),
-        Some(Cmd::Scan) => run_orchestrator(),
-        Some(Cmd::Msg { message }) => run_orchestrator_with_message(&message.join(" ")),
+        Some(Cmd::Status) => cmd_status(),
+        Some(Cmd::Scan) => {
+            let inbox = tasks_dir().join(".inbox");
+            fs::write(&inbox, SCAN_MSG).expect("failed to write to inbox");
+            eprintln!("[orch] scan triggered — daemon will run it");
+        }
+        Some(Cmd::Msg { message }) => {
+            let msg = message.join(" ");
+            let inbox = tasks_dir().join(".inbox");
+            fs::write(&inbox, &msg).expect("failed to write to inbox");
+            eprintln!("[orch] message sent");
+        }
         None => cmd_status(), // default: show status
     }
 }
