@@ -1,20 +1,22 @@
+use std::{
+    collections::HashSet,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::mpsc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
 use clap::{Parser, Subcommand};
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
 
 const SCAN_MSG: &str = "\
-    Scan ~/tasks/ and tmux sessions. For any unstarted task without a worker, \
+    [scan] Scan ~/tasks/ and tmux sessions. For any unstarted task without a worker, \
     spin up an interactive tmux worker session. Update task files with status. \
     Report what you did.";
 
-// ---------------------------------------------------------------------------
 // CLI
-// ---------------------------------------------------------------------------
 
 #[derive(Parser)]
 #[command(name = "orch", about = "Task orchestrator for Claude Code workers")]
@@ -38,69 +40,67 @@ enum Cmd {
     Msg { message: Vec<String> },
 }
 
-// ---------------------------------------------------------------------------
-// Paths & helpers
-// ---------------------------------------------------------------------------
+// Paths
 
 fn tasks_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join("tasks")
 }
 
-fn prompt_file() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        let beside = exe.with_file_name("orchestrator.md");
-        if beside.exists() {
-            return beside;
-        }
-    }
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join("orchestrator/orchestrator.md")
+fn inbox_dir() -> PathBuf {
+    tasks_dir().join(".inbox")
 }
 
-fn log_file() -> fs::File {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(tasks_dir().join(".orch.log"))
-        .expect("failed to open log file")
+fn repo_dir() -> String {
+    std::env::var("ORCH_REPO").expect("ORCH_REPO must be set")
 }
+
+// Inbox
 
 fn write_inbox(msg: &str) {
-    fs::write(tasks_dir().join(".inbox"), msg).expect("failed to write to inbox");
+    let dir = inbox_dir();
+    fs::create_dir_all(&dir).expect("failed to create inbox dir");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = dir.join(format!("{nanos}-{}.msg", std::process::id()));
+    fs::write(path, msg).expect("failed to write inbox message");
 }
 
-fn has_tmux_session(name: &str) -> bool {
-    Command::new("tmux")
-        .args(["has-session", "-t", name])
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+fn drain_inbox() -> Option<String> {
+    let mut entries: Vec<_> = fs::read_dir(inbox_dir())
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "msg"))
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut messages = Vec::new();
+    for entry in entries {
+        if let Ok(msg) = fs::read_to_string(entry.path()) {
+            if !msg.trim().is_empty() {
+                messages.push(msg);
+            }
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    (!messages.is_empty()).then(|| messages.join("\n"))
 }
 
-// ---------------------------------------------------------------------------
-// Claude invocation
-// ---------------------------------------------------------------------------
+// Orchestrator
 
 fn run_orchestrator(message: &str) {
     eprintln!("[orch] {message}");
 
-    let system_prompt = match fs::read_to_string(prompt_file()) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[orch] failed to read prompt: {e}");
-            return;
-        }
-    };
-
-    let prompt = format!("{system_prompt}\n\n---\n\n{message}");
-    let log = log_file();
-
     let mut child = match Command::new("claude")
-        .args(["-p", "--dangerously-skip-permissions"])
+        .args(["-a", "orchestrator", "-p", "--dangerously-skip-permissions"])
+        .env("ORCH_REPO", repo_dir())
         .stdin(Stdio::piped())
-        .stdout(log.try_clone().unwrap())
-        .stderr(log)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
     {
         Ok(c) => c,
@@ -111,7 +111,7 @@ fn run_orchestrator(message: &str) {
     };
 
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt.as_bytes());
+        let _ = stdin.write_all(message.as_bytes());
     }
 
     match child.wait() {
@@ -121,30 +121,48 @@ fn run_orchestrator(message: &str) {
     }
 }
 
-fn drain_inbox() {
-    let inbox = tasks_dir().join(".inbox");
-    if let Ok(msg) = fs::read_to_string(&inbox) {
-        if !msg.trim().is_empty() {
-            let _ = fs::remove_file(&inbox);
-            run_orchestrator(&msg);
-        }
-    }
+// Helpers
+
+fn has_tmux_session(name: &str) -> bool {
+    Command::new("tmux")
+        .args(["has-session", "-t", name])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
-// ---------------------------------------------------------------------------
+fn known_tasks(dir: &Path) -> HashSet<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return HashSet::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect()
+}
+
+/// Lines between `heading` and the next `## ` (or EOF), excluding blanks.
+fn extract_section<'a>(content: &'a str, heading: &str) -> Vec<&'a str> {
+    let mut lines = content.lines();
+    if !lines.any(|l| l.trim().starts_with(heading)) {
+        return Vec::new();
+    }
+    lines
+        .take_while(|l| !l.trim().starts_with("## "))
+        .filter(|l| !l.trim().is_empty())
+        .collect()
+}
+
 // Commands
-// ---------------------------------------------------------------------------
 
 fn cmd_status() {
     let dir = tasks_dir();
-
     println!("## Tasks\n");
-    let entries = match fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => {
-            println!("  ~/tasks/ not found");
-            return;
-        }
+
+    let Ok(entries) = fs::read_dir(&dir) else {
+        println!("  ~/tasks/ not found");
+        return;
     };
 
     let mut found = false;
@@ -159,7 +177,11 @@ fn cmd_status() {
         let content = fs::read_to_string(&path).unwrap_or_default();
         let summary = extract_section(&content, "## Summary");
 
-        let session = format!("task-{name}");
+        let session = content
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("session:").map(|s| s.trim().to_string()))
+            .unwrap_or_else(|| format!("task-{name}"));
+
         let worker = if has_tmux_session(&session) {
             format!("running ({session})")
         } else {
@@ -212,19 +234,30 @@ fn cmd_jump(name: &str) {
 
 fn cmd_daemon() {
     let dir = tasks_dir();
+    let inbox = inbox_dir();
     fs::create_dir_all(&dir).ok();
+    fs::create_dir_all(&inbox).ok();
 
     eprintln!("[orch] daemon started, watching {}", dir.display());
-    drain_inbox();
-    eprintln!("[orch] running initial scan...");
-    run_orchestrator(SCAN_MSG);
 
+    // Fold pending inbox messages into the initial scan
+    let mut startup_msg = String::new();
+    if let Some(msgs) = drain_inbox() {
+        startup_msg.push_str("[message] ");
+        startup_msg.push_str(&msgs);
+        startup_msg.push_str("\n\n");
+    }
+    startup_msg.push_str(SCAN_MSG);
+    eprintln!("[orch] running initial scan...");
+    run_orchestrator(&startup_msg);
+
+    let mut tasks = known_tasks(&dir);
     let (tx, rx) = mpsc::channel();
     let mut debouncer =
         new_debouncer(Duration::from_secs(3), tx).expect("failed to create watcher");
     debouncer
         .watcher()
-        .watch(&dir, RecursiveMode::NonRecursive)
+        .watch(&dir, RecursiveMode::Recursive)
         .expect("failed to watch ~/tasks");
 
     eprintln!("[orch] watching for changes (polling every 5m)...");
@@ -232,22 +265,25 @@ fn cmd_daemon() {
     loop {
         match rx.recv_timeout(Duration::from_secs(5 * 60)) {
             Ok(Ok(events)) => {
-                if events.iter().any(|e| e.path.file_name().is_some_and(|f| f == ".inbox")) {
-                    drain_inbox();
-                }
-
-                let changed: Vec<_> = events
+                let inbox_msgs = events
                     .iter()
-                    .filter(|e| e.path.extension().is_some_and(|ext| ext == "md"))
-                    .filter_map(|e| e.path.file_name().map(|f| f.to_string_lossy().into_owned()))
-                    .collect();
+                    .any(|e| e.path.starts_with(&inbox))
+                    .then(|| drain_inbox())
+                    .flatten();
 
-                if !changed.is_empty() {
-                    run_orchestrator(&format!(
-                        "Task files changed: {}. Check these tasks and handle them — \
-                         spin up workers for new tasks, update status for existing ones.",
-                        changed.join(", ")
-                    ));
+                let current = known_tasks(&dir);
+                let new_tasks: Vec<_> = current.difference(&tasks).cloned().collect();
+                tasks = current;
+
+                let mut parts = Vec::new();
+                if let Some(msgs) = inbox_msgs {
+                    parts.push(format!("[message] {msgs}"));
+                }
+                for task in &new_tasks {
+                    parts.push(format!("[new-task] {task}"));
+                }
+                if !parts.is_empty() {
+                    run_orchestrator(&parts.join("\n\n"));
                 }
             }
             Ok(Err(e)) => eprintln!("[orch] watch error: {e:?}"),
@@ -259,32 +295,6 @@ fn cmd_daemon() {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
-
-/// Extract lines between a `## Heading` and the next `## ` (or EOF).
-fn extract_section<'a>(content: &'a str, heading: &str) -> Vec<&'a str> {
-    let mut inside = false;
-    content
-        .lines()
-        .filter(move |line| {
-            if line.trim().starts_with(heading) {
-                inside = true;
-                return false;
-            }
-            if inside && line.trim().starts_with("## ") {
-                inside = false;
-            }
-            inside && !line.trim().is_empty()
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 fn main() {
     let cli = Cli::parse();
