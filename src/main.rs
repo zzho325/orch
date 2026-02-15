@@ -13,7 +13,7 @@ use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
 
 const SCAN_MSG: &str = "\
     [scan] Scan ~/tasks/ and tmux sessions. For any unstarted task without a worker, \
-    spin up an interactive tmux worker session. Update task files with status. \
+    spin up an interactive tmux worker session. Spawn task-checker sub-agents for active workers. \
     Report what you did.";
 
 // CLI
@@ -96,11 +96,11 @@ fn run_orchestrator(message: &str) {
     eprintln!("[orch] {message}");
 
     let mut child = match Command::new("claude")
-        .args(["-a", "orchestrator", "-p", "--dangerously-skip-permissions"])
+        .args(["--agent", "orchestrator", "-p", "--dangerously-skip-permissions"])
         .env("ORCH_REPO", repo_dir())
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
     {
         Ok(c) => c,
