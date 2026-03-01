@@ -96,8 +96,9 @@ fn run_orchestrator(message: &str) {
     eprintln!("[orch] {message}");
 
     let mut child = match Command::new("claude")
-        .args(["--agent", "orchestrator", "-p", "--dangerously-skip-permissions"])
+        .args(["--model", "opus", "--agent", "orchestrator", "-p", "--dangerously-skip-permissions"])
         .env("ORCH_REPO", repo_dir())
+        .env_remove("CLAUDECODE")
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

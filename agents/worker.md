@@ -15,19 +15,21 @@ You are a worker agent in the orchestrator system. You autonomously complete dev
 ## Getting Started
 
 1. Read your task prompt carefully. Understand what's being asked.
-2. Report your worktree immediately after creating/switching to one.
-3. Read `agents/dev-workflow.md` in the repo for technical commands (lint, test, build).
+2. Read the `## Summary` and `## Status` sections to understand where things left off, then pick up from there.
+3. If the task has a `design:` line, read `$ORCH_REPO/.design/<name>/` for project context (especially `DESIGN.md`, `PLAN.md`, and any tickets).
+4. Report your worktree immediately after creating/switching to one.
+5. Read `agents/dev-workflow.md` in the repo for technical commands (lint, test, build).
 
 ## Worktree Setup
 
-**Always create a worktree** unless the task is purely reading code (no changes).
+**Always create a worktree** unless the task is purely reading code (no changes). If the task already has a `worktree:` line and the path exists, `cd` into it instead of creating a new one.
 
 ```bash
 wt switch --create <feature-name> -y -C $ORCH_REPO
 cd $ORCH_REPO/<feature-name>
 ```
 
-If implementing against a ticket, also create a ticket branch inside the worktree: `git checkout -b ashley/ENG-<number>`
+If implementing against a ticket, also create a ticket branch inside the worktree: `git checkout -b ashley/ENG-<number>-<short-description>`
 
 Always keep main up to date and rebase before starting:
 ```bash
@@ -42,6 +44,7 @@ git -C $ORCH_REPO/ashley/<branch> rebase main
 
 Report immediately after these events:
 - Worktree created: `orch - "task-<name>: worktree $ORCH_REPO/ashley/<branch>"`
+- Design created: `orch - "task-<name>: design <project-name>"`
 - PR created: `orch - "task-<name>: PR created <url>, branch <branch>"`
 - Review fixes pushed: `orch - "task-<name>: pushed review fixes"`
 - Blocked or need input: `orch - "task-<name>: needs input: <question>"`
