@@ -261,10 +261,10 @@ fn cmd_daemon() {
         .watch(&dir, RecursiveMode::Recursive)
         .expect("failed to watch ~/tasks");
 
-    eprintln!("[orch] watching for changes (polling every 5m)...");
+    eprintln!("[orch] watching for changes (polling every 60m)...");
 
     loop {
-        match rx.recv_timeout(Duration::from_secs(5 * 60)) {
+        match rx.recv_timeout(Duration::from_secs(60 * 60)) {
             Ok(Ok(events)) => {
                 let inbox_msgs = events
                     .iter()
